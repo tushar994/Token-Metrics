@@ -17,11 +17,26 @@ contract MultiStrategyVault is ERC4626, AccessControl, Pausable {
     bytes32 public constant STRATEGY_MANAGER_ROLE =
         keccak256("STRATEGY_MANAGER_ROLE");
 
+    // Withdrawal request struct for EIP-7540 async redemptions
+    struct WithdrawalRequest {
+        uint256 shares; // Amount of shares to redeem
+        address owner; // Owner of the request
+        uint256 timestamp; // When request was created
+        bool isPending; // Whether request is still pending
+    }
+
     // State variables
     uint256 public totalAssetsInStrategies;
 
     // Strategy debt tracking: strategy address => current debt
     mapping(address => uint256) public strategyDebt;
+
+    // EIP-7540 Async withdrawal tracking
+    // owner => requestId => WithdrawalRequest
+    mapping(address => mapping(uint256 => WithdrawalRequest))
+        public withdrawalRequests;
+    // owner => next request ID counter
+    mapping(address => uint256) public nextRequestId;
 
     // Events
     event Deposited(address indexed user, uint256 assets, uint256 shares);
@@ -36,6 +51,16 @@ contract MultiStrategyVault is ERC4626, AccessControl, Pausable {
         uint256 gain,
         uint256 loss,
         uint256 currentDebt
+    );
+    event WithdrawalRequested(
+        address indexed owner,
+        uint256 indexed requestId,
+        uint256 shares
+    );
+    event WithdrawalClaimed(
+        address indexed owner,
+        uint256 indexed requestId,
+        uint256 assets
     );
 
     /**
@@ -78,35 +103,25 @@ contract MultiStrategyVault is ERC4626, AccessControl, Pausable {
     }
 
     /**
-     * @notice Withdraws assets from the vault by burning shares
-     * @param assets Amount of USDC to withdraw
-     * @param receiver Address to receive the USDC
-     * @param owner Address that owns the shares
-     * @return shares Amount of shares burned
+     * @notice Withdraws are disabled - use requestRedeem() for async withdrawals
      */
     function withdraw(
         uint256 assets,
         address receiver,
         address owner
     ) public virtual override returns (uint256 shares) {
-        shares = super.withdraw(assets, receiver, owner);
-        emit Withdrawn(owner, assets, shares);
+        revert("Use requestRedeem() for async withdrawals");
     }
 
     /**
-     * @notice Redeems shares for assets
-     * @param shares Amount of shares to burn
-     * @param receiver Address to receive the USDC
-     * @param owner Address that owns the shares
-     * @return assets Amount of USDC withdrawn
+     * @notice Redeems are disabled - use requestRedeem() for async withdrawals
      */
     function redeem(
         uint256 shares,
         address receiver,
         address owner
     ) public virtual override returns (uint256 assets) {
-        assets = super.redeem(shares, receiver, owner);
-        emit Withdrawn(owner, assets, shares);
+        revert("Use requestRedeem() for async withdrawals");
     }
 
     /**
@@ -272,5 +287,144 @@ contract MultiStrategyVault is ERC4626, AccessControl, Pausable {
         }
 
         emit StrategyReported(strategy, gain, loss, strategyDebt[strategy]);
+    }
+
+    // ============ EIP-7540 Async Withdrawal Functions ============
+
+    /**
+     * @notice Request an asynchronous redemption of shares
+     * @dev Burns shares immediately. If vault has idle assets, fulfills immediately. Otherwise creates pending request.
+     * @param shares Amount of shares to redeem
+     * @param owner Owner of the shares (must approve if not msg.sender)
+     * @return requestId The ID of the withdrawal request (0 if fulfilled immediately)
+     */
+    function requestRedeem(
+        uint256 shares,
+        address owner
+    ) external returns (uint256 requestId) {
+        require(shares > 0, "Cannot redeem zero shares");
+        require(owner != address(0), "Invalid owner");
+
+        // Check approval if msg.sender is not the owner
+        if (msg.sender != owner) {
+            uint256 allowed = allowance(owner, msg.sender);
+            if (allowed != type(uint256).max) {
+                require(allowed >= shares, "Insufficient allowance");
+                _approve(owner, msg.sender, allowed - shares);
+            }
+        }
+
+        // Calculate assets owed at current share price
+        uint256 assets = convertToAssets(shares);
+
+        // Transfer shares to vault (keeps totalSupply correct for pending requests)
+        _transfer(owner, address(this), shares);
+
+        // Check if vault has enough idle assets
+        uint256 idleAssets = IERC20(asset()).balanceOf(address(this));
+
+        if (idleAssets >= assets) {
+            // Vault has enough idle assets - fulfill immediately
+            // Burn shares since we're completing the withdrawal
+            _burn(address(this), shares);
+            SafeERC20.safeTransfer(IERC20(asset()), owner, assets);
+            emit Withdrawn(owner, assets, shares);
+            return 0; // 0 indicates immediate fulfillment
+        } else {
+            // Not enough idle assets - create pending request
+            // Shares stay in vault until claimed
+            requestId = nextRequestId[owner]++;
+
+            withdrawalRequests[owner][requestId] = WithdrawalRequest({
+                shares: shares,
+                owner: owner,
+                timestamp: block.timestamp,
+                isPending: true
+            });
+
+            emit WithdrawalRequested(owner, requestId, shares);
+            return requestId;
+        }
+    }
+
+    /**
+     * @notice Claim a pending withdrawal request
+     * @dev Can only be called by the request owner once enough assets are available
+     * @param requestId The ID of the withdrawal request to claim
+     * @return assets Amount of assets transferred
+     */
+    function claimWithdrawal(
+        uint256 requestId
+    ) external returns (uint256 assets) {
+        WithdrawalRequest storage request = withdrawalRequests[msg.sender][
+            requestId
+        ];
+
+        require(request.isPending, "Request not pending or does not exist");
+        require(request.owner == msg.sender, "Not request owner");
+
+        // Calculate assets owed
+        assets = convertToAssets(request.shares);
+        uint256 idleAssets = IERC20(asset()).balanceOf(address(this));
+
+        require(idleAssets >= assets, "Insufficient idle assets");
+
+        // Mark request as claimed
+        request.isPending = false;
+
+        // Burn the shares that were held by the vault
+        _burn(address(this), request.shares);
+
+        // Transfer assets
+        SafeERC20.safeTransfer(IERC20(asset()), msg.sender, assets);
+
+        emit WithdrawalClaimed(msg.sender, requestId, assets);
+    }
+
+    /**
+     * @notice Get the amount of shares in a pending withdrawal request
+     * @param owner Owner of the request
+     * @param requestId ID of the request
+     * @return shares Amount of shares pending
+     */
+    function pendingWithdrawal(
+        address owner,
+        uint256 requestId
+    ) external view returns (uint256 shares) {
+        WithdrawalRequest storage request = withdrawalRequests[owner][
+            requestId
+        ];
+        if (request.isPending) {
+            return request.shares;
+        }
+        return 0;
+    }
+
+    /**
+     * @notice Get the amount of assets claimable for a withdrawal request
+     * @param owner Owner of the request
+     * @param requestId ID of the request
+     * @return assets Amount of assets that can be claimed (0 if not enough idle assets)
+     */
+    function claimableWithdrawal(
+        address owner,
+        uint256 requestId
+    ) external view returns (uint256 assets) {
+        WithdrawalRequest storage request = withdrawalRequests[owner][
+            requestId
+        ];
+
+        if (!request.isPending) {
+            return 0;
+        }
+
+        assets = convertToAssets(request.shares);
+        uint256 idleAssets = IERC20(asset()).balanceOf(address(this));
+
+        // Only claimable if vault has enough idle assets
+        if (idleAssets >= assets) {
+            return assets;
+        }
+        return 0;
     }
 }

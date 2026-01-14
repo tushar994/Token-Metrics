@@ -140,23 +140,23 @@ contract MultiStrategyVaultTest is Test {
         vm.prank(alice);
         vault.deposit(DEPOSIT_AMOUNT, alice);
 
-        // Alice withdraws half
-        uint256 withdrawAmount = DEPOSIT_AMOUNT / 2;
+        // Alice requests redemption for half her shares
+        uint256 sharesToRedeem = DEPOSIT_AMOUNT / 2;
 
         vm.startPrank(alice);
         uint256 usdcBefore = usdc.balanceOf(alice);
-        uint256 sharesBurned = vault.withdraw(withdrawAmount, alice, alice);
+
+        // Request redeem (should fulfill immediately since vault has assets)
+        uint256 requestId = vault.requestRedeem(sharesToRedeem, alice);
+
+        // requestId 0 means immediate fulfillment
+        assertEq(requestId, 0, "Should fulfill immediately");
 
         // Verify USDC returned
         assertEq(
             usdc.balanceOf(alice),
-            usdcBefore + withdrawAmount,
+            usdcBefore + sharesToRedeem,
             "Alice should receive USDC"
-        );
-        assertEq(
-            sharesBurned,
-            withdrawAmount,
-            "Shares burned should equal withdrawal amount"
         );
 
         vm.stopPrank();
@@ -168,17 +168,17 @@ contract MultiStrategyVaultTest is Test {
 
         vm.startPrank(alice);
 
-        uint256 withdrawAmount = DEPOSIT_AMOUNT / 2;
+        uint256 sharesToRedeem = DEPOSIT_AMOUNT / 2;
 
-        // Expect Withdrawn event
+        // Expect Withdrawn event (immediate fulfillment)
         vm.expectEmit(true, false, false, true);
         emit MultiStrategyVault.Withdrawn(
             alice,
-            withdrawAmount,
-            withdrawAmount
+            sharesToRedeem,
+            sharesToRedeem
         );
 
-        vault.withdraw(withdrawAmount, alice, alice);
+        vault.requestRedeem(sharesToRedeem, alice);
 
         vm.stopPrank();
     }
@@ -188,16 +188,14 @@ contract MultiStrategyVaultTest is Test {
         vm.prank(alice);
         uint256 shares = vault.deposit(DEPOSIT_AMOUNT, alice);
 
-        // Alice redeems all shares
+        // Alice redeems all shares via requestRedeem
         vm.startPrank(alice);
         uint256 usdcBefore = usdc.balanceOf(alice);
-        uint256 assets = vault.redeem(shares, alice, alice);
+        uint256 requestId = vault.requestRedeem(shares, alice);
 
-        assertEq(
-            assets,
-            DEPOSIT_AMOUNT,
-            "Should receive deposited amount back"
-        );
+        // Should fulfill immediately
+        assertEq(requestId, 0, "Should fulfill immediately");
+
         assertEq(
             usdc.balanceOf(alice),
             usdcBefore + DEPOSIT_AMOUNT,
@@ -250,7 +248,7 @@ contract MultiStrategyVaultTest is Test {
         vault.deposit(DEPOSIT_AMOUNT, alice);
 
         vm.prank(alice);
-        vault.withdraw(DEPOSIT_AMOUNT / 2, alice, alice);
+        vault.requestRedeem(DEPOSIT_AMOUNT / 2, alice);
 
         assertEq(
             vault.totalAssets(),
@@ -330,14 +328,13 @@ contract MultiStrategyVaultTest is Test {
         uint256 assets = 100 * 1e6;
         uint256 expectedShares = vault.previewWithdraw(assets);
 
-        vm.prank(alice);
-        uint256 actualShares = vault.withdraw(assets, alice, alice);
+        vm.startPrank(alice);
+        uint256 balanceBefore = usdc.balanceOf(alice);
+        vault.requestRedeem(expectedShares, alice);
+        uint256 actualAssets = usdc.balanceOf(alice) - balanceBefore;
 
-        assertEq(
-            actualShares,
-            expectedShares,
-            "Preview should match actual withdraw"
-        );
+        assertEq(actualAssets, assets, "Actual assets should match expected");
+        vm.stopPrank();
     }
 
     function test_PreviewRedeem() public {
@@ -347,14 +344,17 @@ contract MultiStrategyVaultTest is Test {
         uint256 shares = 100 * 1e6;
         uint256 expectedAssets = vault.previewRedeem(shares);
 
-        vm.prank(alice);
-        uint256 actualAssets = vault.redeem(shares, alice, alice);
+        vm.startPrank(alice);
+        uint256 balanceBefore = usdc.balanceOf(alice);
+        vault.requestRedeem(shares, alice);
+        uint256 actualAssets = usdc.balanceOf(alice) - balanceBefore;
 
         assertEq(
             actualAssets,
             expectedAssets,
             "Preview should match actual redeem"
         );
+        vm.stopPrank();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -456,8 +456,11 @@ contract MultiStrategyVaultTest is Test {
         vm.prank(alice);
         vault.deposit(depositAmount, alice);
 
+        // Convert withdraw amount to shares
+        uint256 sharesToRedeem = vault.previewWithdraw(withdrawAmount);
+
         vm.prank(alice);
-        vault.withdraw(withdrawAmount, alice, alice);
+        vault.requestRedeem(sharesToRedeem, alice);
 
         assertEq(
             vault.totalAssets(),
