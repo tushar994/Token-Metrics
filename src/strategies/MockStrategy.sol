@@ -4,17 +4,59 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IStrategy.sol";
 
 /**
- * @title HoldingStrategy
- * @notice A simple strategy that holds funds without investing them.
+ * @title MockStrategy
+ * @notice A mock strategy for testing with admin controls to simulate P&L
  */
-contract HoldingStrategy is ERC4626, IStrategy {
-    constructor(
-        IERC20 _asset
-    ) ERC4626(_asset) ERC20("Holding Strategy", "HOLD") {}
+contract MockStrategy is ERC4626, IStrategy {
+    address public admin;
 
+    event ProfitAdded(uint256 amount);
+    event LossSimulated(uint256 amount);
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Only admin");
+        _;
+    }
+
+    constructor(
+        IERC20 _asset,
+        address _admin
+    ) ERC4626(_asset) ERC20("Mock Strategy", "MOCK") {
+        require(_admin != address(0), "Invalid admin");
+        admin = _admin;
+    }
+
+    /**
+     * @notice Simulate profit by adding assets to the strategy
+     * @param amount Amount of assets to add
+     */
+    function addProfit(uint256 amount) external onlyAdmin {
+        SafeERC20.safeTransferFrom(
+            IERC20(asset()),
+            msg.sender,
+            address(this),
+            amount
+        );
+        emit ProfitAdded(amount);
+    }
+
+    /**
+     * @notice Simulate loss by removing assets from the strategy
+     * @param amount Amount of assets to remove
+     */
+    function simulateLoss(uint256 amount) external onlyAdmin {
+        uint256 balance = IERC20(asset()).balanceOf(address(this));
+        require(balance >= amount, "Insufficient balance");
+
+        SafeERC20.safeTransfer(IERC20(asset()), msg.sender, amount);
+        emit LossSimulated(amount);
+    }
+
+    // IStrategy overrides
     function asset()
         public
         view

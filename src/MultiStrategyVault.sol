@@ -25,11 +25,24 @@ contract MultiStrategyVault is ERC4626, AccessControl, Pausable {
         bool isPending; // Whether request is still pending
     }
 
+    // Strategy configuration
+    struct StrategyConfig {
+        uint256 maxAllocationBPS; // Max allocation in basis points (max 5000 = 50%)
+        bool isActive; // Whether strategy is active
+    }
+
+    // Constants
+    uint256 public constant MAX_BPS = 10000; // 100%
+    uint256 public constant MAX_STRATEGY_ALLOCATION_BPS = 5000; // 50% max per strategy
+
     // State variables
     uint256 public totalAssetsInStrategies;
 
     // Strategy debt tracking: strategy address => current debt
     mapping(address => uint256) public strategyDebt;
+
+    // Strategy configuration: strategy address => config
+    mapping(address => StrategyConfig) public strategyConfig;
 
     // EIP-7540 Async withdrawal tracking
     // owner => requestId => WithdrawalRequest
@@ -61,6 +74,16 @@ contract MultiStrategyVault is ERC4626, AccessControl, Pausable {
         address indexed owner,
         uint256 indexed requestId,
         uint256 assets
+    );
+    event StrategyConfigured(
+        address indexed strategy,
+        uint256 maxAllocationBPS
+    );
+    event DebugAllowanceCheck(
+        address indexed msgSender,
+        address indexed owner,
+        uint256 shares,
+        uint256 allowance
     );
 
     /**
@@ -150,8 +173,37 @@ contract MultiStrategyVault is ERC4626, AccessControl, Pausable {
         _unpause();
     }
 
+    // ============ Strategy Management Functions ============
+
     /**
-     * @notice Updates the debt allocation for a strategy
+     * @notice Configure a strategy's parameters
+     * @param strategy Address of the strategy
+     * @param maxAllocationBPS Maximum allocation in basis points (max 5000 = 50%)
+     */
+    function setStrategyConfig(
+        address strategy,
+        uint256 maxAllocationBPS
+    ) external onlyRole(STRATEGY_MANAGER_ROLE) {
+        require(strategy != address(0), "Invalid strategy");
+        require(
+            maxAllocationBPS <= MAX_STRATEGY_ALLOCATION_BPS,
+            "Exceeds max allocation limit"
+        );
+        require(
+            IStrategy(strategy).asset() == asset(),
+            "Strategy asset mismatch"
+        );
+
+        strategyConfig[strategy] = StrategyConfig({
+            maxAllocationBPS: maxAllocationBPS,
+            isActive: maxAllocationBPS > 0
+        });
+
+        emit StrategyConfigured(strategy, maxAllocationBPS);
+    }
+
+    /**
+     * @notice Update debt allocation to a strategy
      * @dev Simplified version of Yearn's update_debt. Either deposits to or withdraws from strategy.
      * @param strategy Address of the strategy to update
      * @param targetDebt The desired debt amount for the strategy
@@ -172,6 +224,19 @@ contract MultiStrategyVault is ERC4626, AccessControl, Pausable {
         if (targetDebt > currentDebt) {
             // Increase debt - deposit to strategy
             uint256 assetsToDeposit = targetDebt - currentDebt;
+
+            // Check strategy is configured and active
+            StrategyConfig memory config = strategyConfig[strategy];
+            require(config.isActive, "Strategy not active");
+
+            // Check max allocation limit
+            uint256 vaultTotalAssets = totalAssets();
+            uint256 maxAllocation = (vaultTotalAssets *
+                config.maxAllocationBPS) / MAX_BPS;
+            require(
+                targetDebt <= maxAllocation,
+                "Exceeds strategy max allocation"
+            );
 
             // Check if vault has enough idle assets
             uint256 idleAssets = IERC20(asset()).balanceOf(address(this));
@@ -308,6 +373,8 @@ contract MultiStrategyVault is ERC4626, AccessControl, Pausable {
         // Check approval if msg.sender is not the owner
         if (msg.sender != owner) {
             uint256 allowed = allowance(owner, msg.sender);
+            emit DebugAllowanceCheck(msg.sender, owner, shares, allowed);
+
             if (allowed != type(uint256).max) {
                 require(allowed >= shares, "Insufficient allowance");
                 _approve(owner, msg.sender, allowed - shares);
@@ -333,7 +400,7 @@ contract MultiStrategyVault is ERC4626, AccessControl, Pausable {
         } else {
             // Not enough idle assets - create pending request
             // Shares stay in vault until claimed
-            requestId = nextRequestId[owner]++;
+            requestId = ++nextRequestId[owner];
 
             withdrawalRequests[owner][requestId] = WithdrawalRequest({
                 shares: shares,
