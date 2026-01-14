@@ -33,7 +33,8 @@ contract MultiStrategyVault is ERC4626, AccessControl, Pausable {
 
     // Constants
     uint256 public constant MAX_BPS = 10000; // 100%
-    uint256 public constant MAX_STRATEGY_ALLOCATION_BPS = 5000; // 50% max per strategy
+    // For my deployment, I set this to be 10000, but it should be set lower, to something like 5000
+    uint256 public constant MAX_STRATEGY_ALLOCATION_BPS = 10000;
 
     // State variables
     uint256 public totalAssetsInStrategies;
