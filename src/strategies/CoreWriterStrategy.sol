@@ -11,6 +11,10 @@ interface ICoreWriter {
     function sendRawAction(bytes calldata data) external;
 }
 
+interface IBridge {
+    function deposit(uint256 amount, uint32 destinationDex) external;
+}
+
 /**
  * @title CoreWriterStrategy
  * @notice ERC4626 vault strategy for Core blockchain with action execution capabilities
@@ -32,6 +36,11 @@ contract CoreWriterStrategy is ERC4626, AccessControl, IStrategy {
         uint256 tokenIndex
     );
     event CoreActionExecuted(bytes1 versionByte, uint32 actionId);
+    event USDCTransferredToBridge(uint256 amount);
+
+    // Constants
+    address public constant BRIDGE_ADDRESS =
+        0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24;
 
     constructor(
         IERC20 _asset,
@@ -97,6 +106,27 @@ contract CoreWriterStrategy is ERC4626, AccessControl, IStrategy {
         tokenContract.transfer(systemAddress, amount);
 
         emit TokenSentToLayer1(token, amount, tokenIndex);
+    }
+
+    /**
+     * @notice Transfer USDC to bridge contract
+     * @param amount Amount of USDC to transfer
+     */
+    function transferUSDC(uint256 amount) external onlyRole(EXECUTOR_ROLE) {
+        if (amount == 0) revert ZeroAmount();
+
+        IERC20 usdc = IERC20(asset());
+        uint256 balance = usdc.balanceOf(address(this));
+
+        if (amount > balance) revert InsufficientBalance();
+
+        // Approve bridge to spend USDC
+        usdc.approve(BRIDGE_ADDRESS, amount);
+
+        // Deposit to bridge with destinationDex as uint32.max
+        IBridge(BRIDGE_ADDRESS).deposit(amount, type(uint32).max);
+
+        emit USDCTransferredToBridge(amount);
     }
 
     // IStrategy interface overrides
